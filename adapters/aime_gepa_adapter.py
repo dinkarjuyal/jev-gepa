@@ -24,21 +24,36 @@ from gepa.core.adapter import EvaluationBatch, GEPAAdapter
 # returns) is the actual fix -- it can't be silently bypassed by whatever
 # layer (httpx connection pool, DNS, the remote server itself) was eating
 # litellm's own timeout.
-_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+#
+# SECOND real bug found live, burning more budget on top of the above: the
+# first version of this fix used one SHARED, bounded ThreadPoolExecutor
+# (max_workers=8). The comment below used to claim an abandoned thread
+# "just wastes one worker slot" was harmless -- it is not. Every timed-out
+# call permanently occupies a slot forever (the abandoned thread is never
+# awaited or killed), so after ~8 real hangs the entire pool is starved:
+# every NEW call then has to wait the full timeout just to get a worker
+# that's never free, then gives up anyway -- which looks identical to a
+# hang from the outside (frozen CPU time, no progress) even though the
+# timeout mechanism is technically "working". Fixed by giving every call
+# its OWN single-use, single-worker executor instead of sharing one pool --
+# an abandoned thread then only ever wastes its own disposable executor,
+# never blocking any other call.
 
 
 def _with_hard_timeout(fn, timeout_s: float = 150.0, retries: int = 1):
     for attempt in range(retries + 1):
-        fut = _EXECUTOR.submit(fn)
+        executor = ThreadPoolExecutor(max_workers=1)  # single-use, never shared
+        fut = executor.submit(fn)
         try:
             return fut.result(timeout=timeout_s)
         except FutureTimeoutError:
             if attempt == retries:
                 return None  # give up; caller treats this as an empty/failed response
-            # the abandoned thread keeps running in the background and is never
-            # awaited again -- acceptable here since ThreadPoolExecutor doesn't
-            # leak resources for this, just wastes one worker slot until (if
-            # ever) the underlying call actually returns.
+            # this call's executor (and its one abandoned thread, if the call
+            # ever does return) is simply dropped here -- it cannot starve any
+            # future call, since every call gets a fresh executor.
+        finally:
+            executor.shutdown(wait=False)
 
 
 class AIMEDataInst(TypedDict):
