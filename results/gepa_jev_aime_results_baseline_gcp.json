@@ -1,0 +1,12 @@
+{
+  "best_candidate": {
+    "instructions": "You are a mathematics expert. Solve the given AIME problem step by step and give your final numeric answer prefixed with '### '."
+  },
+  "val_aggregate_scores": [
+    0.6666666666666666,
+    0.5333333333333333,
+    0.5333333333333333,
+    0.6666666666666666
+  ],
+  "best_idx": 0
+}

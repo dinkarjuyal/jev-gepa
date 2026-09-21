@@ -13,10 +13,13 @@ import gepa
 from gepa.examples.aime import init_dataset
 from aime_gepa_adapter import JevAIMEAdapter
 
-PIT_KEY = json.load(open(Path.home() / "pit_config.json"))["api_key"]
-PIT_BASE = "https://api.pinference.ai/api/v1"
-TASK_MODEL = "openai/Qwen/Qwen3.5-4B"
-REFLECTION_MODEL = "openai/openai/gpt-oss-120b"
+import os
+os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", os.path.expanduser("~/adc.json"))
+GCP_PROJECT = "intrepid-app-509303-p9"
+GCP_LOCATION = "europe-west4"
+VERTEX_KWARGS = {"vertex_project": GCP_PROJECT, "vertex_location": GCP_LOCATION}
+TASK_MODEL = "vertex_ai/gemini-2.5-flash-lite"  # see run_baseline_only.py for why
+REFLECTION_MODEL = "vertex_ai/gemini-2.5-pro"
 MAX_METRIC_CALLS = 60
 
 print("Loading AIME dataset...", flush=True)
@@ -57,14 +60,15 @@ from aime_gepa_adapter import _with_hard_timeout  # noqa: E402  (same hard-timeo
 def reflection_lm_fn(prompt: str) -> str:
     def call():
         return litellm.completion(
-            model=REFLECTION_MODEL, api_base=PIT_BASE, api_key=PIT_KEY,
+            model=REFLECTION_MODEL,
             messages=[{"role": "user", "content": prompt}], timeout=240,
+            max_tokens=16000, **VERTEX_KWARGS,
         )
     resp = _with_hard_timeout(call)
     return (resp.choices[0].message.content or "") if resp else ""
 
 
-adapter = JevAIMEAdapter(TASK_MODEL, PIT_BASE, PIT_KEY, jev, QUESTIONS)
+adapter = JevAIMEAdapter(TASK_MODEL, VERTEX_KWARGS, jev, QUESTIONS)
 
 print(f"\n{'='*70}\nRunning GEPA on AIME: jev_enriched\n{'='*70}", flush=True)
 result = gepa.optimize(

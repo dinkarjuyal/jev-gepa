@@ -8,6 +8,7 @@ to a single chain-of-thought instead of a multi-turn agent trace.
 from __future__ import annotations
 
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import TypedDict
 
@@ -40,20 +41,40 @@ from gepa.core.adapter import EvaluationBatch, GEPAAdapter
 # never blocking any other call.
 
 
-def _with_hard_timeout(fn, timeout_s: float = 150.0, retries: int = 1):
-    for attempt in range(retries + 1):
-        executor = ThreadPoolExecutor(max_workers=1)  # single-use, never shared
-        fut = executor.submit(fn)
-        try:
-            return fut.result(timeout=timeout_s)
-        except FutureTimeoutError:
-            if attempt == retries:
-                return None  # give up; caller treats this as an empty/failed response
-            # this call's executor (and its one abandoned thread, if the call
-            # ever does return) is simply dropped here -- it cannot starve any
-            # future call, since every call gets a fresh executor.
-        finally:
-            executor.shutdown(wait=False)
+def _with_hard_timeout(fn, timeout_s: float = 150.0, retries: int = 1, rate_limit_retries: int = 15):
+    # THIRD real bug found live: switching to Vertex AI (gemini-2.5-flash-lite),
+    # both concurrent arms hit a real, uncaught litellm.RateLimitError (HTTP
+    # 429 RESOURCE_EXHAUSTED) almost immediately and the whole script crashed
+    # -- this function only ever handled TIMEOUTS, never retried on a real
+    # exception raised promptly by the call itself. Rate limits are ordinary
+    # and expected, especially running two arms concurrently against a fresh
+    # project's quota. Kept as a SEPARATE retry budget from the timeout one:
+    # a rate-limit retry only costs a sleep (cheap, worth retrying many
+    # times with backoff), whereas a timeout retry re-attempts a call that
+    # may genuinely be stuck (expensive, kept bounded for budget safety).
+    backoff = 5.0
+    rl_attempt = 0
+    while True:
+        for attempt in range(retries + 1):
+            executor = ThreadPoolExecutor(max_workers=1)  # single-use, never shared
+            fut = executor.submit(fn)
+            try:
+                return fut.result(timeout=timeout_s)
+            except FutureTimeoutError:
+                if attempt == retries:
+                    return None  # give up; caller treats this as an empty/failed response
+                # this call's executor (and its one abandoned thread, if the call
+                # ever does return) is simply dropped here -- it cannot starve any
+                # future call, since every call gets a fresh executor.
+            except litellm.RateLimitError:
+                if rl_attempt >= rate_limit_retries:
+                    raise  # out of rate-limit retries -- let it surface for real
+                rl_attempt += 1
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+                break  # restart the outer while loop with a fresh timeout-attempt count
+            finally:
+                executor.shutdown(wait=False)
 
 
 class AIMEDataInst(TypedDict):
@@ -81,7 +102,15 @@ def _extract_int(text: str) -> int | None:
     # -- compare as integers instead, using the LAST "### <n>" match (the
     # final-answer line per the seed prompt's own instructions).
     matches = re.findall(r"###\s*(\d+)", text)
-    return int(matches[-1]) if matches else None
+    if matches:
+        return int(matches[-1])
+    # Real second bug found live: Gemini 2.5 Flash-Lite sometimes ignores the
+    # requested "### " format and writes \boxed{95} instead (real example: a
+    # correct answer that the seed prompt's own instructions never mentioned
+    # \boxed{} for). Fall back to it rather than silently score a correct
+    # answer as a miss purely because of format drift.
+    boxed = re.findall(r"\\boxed\{(\d+)\}", text)
+    return int(boxed[-1]) if boxed else None
 
 
 def _chunk(text: str, cap: int = 24) -> list[dict]:
@@ -127,10 +156,19 @@ def _chunk(text: str, cap: int = 24) -> list[dict]:
     return out
 
 
-def _solve(model: str, api_base: str, api_key: str, system_prompt: str, problem: str) -> str:
+def _solve(model: str, litellm_kwargs: dict, system_prompt: str, problem: str, max_tokens: int = 20000) -> str:
+    # Real finding: standard Gemini pay-as-you-go access on Vertex AI uses
+    # Dynamic Shared Quota (DSQ), not a fixed per-project number -- confirmed
+    # by searching the actual quota catalog for "gemini-2.5-flash-lite" and
+    # finding no explicit, raisable entry (only the unrelated -tts variant
+    # has one). 429s under DSQ reflect real-time shared-capacity contention,
+    # not something a quota-increase request fixes. Reducing max_tokens from
+    # the earlier 32000 to 20000 (real observed usage tops out ~14-16K even
+    # on hard problems) eases output-token pressure without real truncation
+    # risk, on top of the retry/backoff already in _with_hard_timeout.
     def call():
         return litellm.completion(
-            model=model, api_base=api_base, api_key=api_key,
+            model=model,
             messages=[{"role": "system", "content": system_prompt},
                       {"role": "user", "content": problem}],
             timeout=270,
@@ -139,9 +177,17 @@ def _solve(model: str, api_base: str, api_key: str, system_prompt: str, problem:
             # problems correctly (verified: n_4=73 for the real answer 073) inside
             # reasoning_content, but 1500/6000 max_tokens cut generation off via
             # finish_reason="length" before it ever reached the formatted "### "
-            # answer in `content`, which came back None every time. At ~260 tok/s
-            # observed, 16000 tokens is still only ~60s/call.
-            max_tokens=16000,
+            # answer in `content`, which came back None every time.
+            #
+            # Same class of bug re-confirmed live on Gemini 2.5 Flash via Vertex
+            # AI: its hidden "thinking" tokens ate 7681 of an 8000 budget, same
+            # empty-content-despite-real-progress symptom. Gemini 2.5 Flash-Lite
+            # has no hidden thinking budget (reasoning_tokens always None) but is
+            # simply verbose in VISIBLE text on hard problems -- confirmed a real
+            # hard AIME problem converges correctly by ~14K tokens, so 32000 is
+            # generous headroom, not a guess.
+            max_tokens=max_tokens,
+            **litellm_kwargs,
         )
 
     resp = _with_hard_timeout(call)
@@ -158,14 +204,14 @@ def _solve(model: str, api_base: str, api_key: str, system_prompt: str, problem:
 
 
 class AIMEAdapter(GEPAAdapter[AIMEDataInst, AIMETrajectory, AIMERolloutOutput]):
-    def __init__(self, model: str, api_base: str, api_key: str):
-        self.model, self.api_base, self.api_key = model, api_base, api_key
+    def __init__(self, model: str, litellm_kwargs: dict):
+        self.model, self.litellm_kwargs = model, litellm_kwargs
 
     def evaluate(self, batch, candidate, capture_traces=False):
         system_prompt = next(iter(candidate.values()))
         outputs, scores, trajectories = [], [], [] if capture_traces else None
         for data in batch:
-            response = _solve(self.model, self.api_base, self.api_key, system_prompt, data["input"])
+            response = _solve(self.model, self.litellm_kwargs, system_prompt, data["input"])
             expected = _extract_int(data["answer"])
             got = _extract_int(response)
             correct = expected is not None and got is not None and expected == got
@@ -194,9 +240,21 @@ class AIMEAdapter(GEPAAdapter[AIMEDataInst, AIMETrajectory, AIMERolloutOutput]):
 
 
 class JevAIMEAdapter(AIMEAdapter):
-    def __init__(self, model: str, api_base: str, api_key: str, jev, questions: dict[str, str]):
-        super().__init__(model, api_base, api_key)
+    def __init__(self, model: str, litellm_kwargs: dict, jev, questions: dict[str, str]):
+        super().__init__(model, litellm_kwargs)
         self.jev, self.questions = jev, questions
+
+    # Real dilution hypothesis found live, for free (offline analysis of
+    # already-collected tags from the n=30 run): 76.5% of all tag values
+    # across 720 real chunks are near-zero (<0.15), and the unfiltered
+    # diagnostic-tags block added ~6,183 chars of mostly-noise text per
+    # example to what the reflection model has to read. Thresholding to
+    # only report tags >=0.2, and skipping chunks where nothing clears that
+    # bar, cut the block to ~1,797 chars (-71%) while keeping 80.8% of
+    # chunks (those with real signal) -- testing whether the RAW ADDITION
+    # of near-zero tags was itself hurting reflection by drowning out the
+    # few genuinely informative ones, not helping it.
+    TAG_THRESHOLD = 0.2
 
     def make_reflective_dataset(self, candidate, eval_batch, components_to_update):
         component = components_to_update[0]
@@ -210,14 +268,20 @@ class JevAIMEAdapter(AIMEAdapter):
                 # display just the chunk's own text for readability.
                 pairs = [(chunk["premise"], stmt) for stmt in self.questions.values()]
                 preds = self.jev.predict(pairs)
-                tags = ", ".join(f"{name}={float(p[1]):.2f}" for name, p in zip(self.questions, preds))
+                strong = [(name, float(p[1])) for name, p in zip(self.questions, preds)
+                          if float(p[1]) >= self.TAG_THRESHOLD]
+                if not strong:
+                    continue  # no informative tag on this chunk -- omit it entirely
+                tags = ", ".join(f"{name}={v:.2f}" for name, v in strong)
                 tag_lines.append(f"[{chunk['text'][:150]}] -> {tags}")
             additional = "\n".join(f"{k}: {v}" for k, v in traj["data"]["additional_context"].items())
+            tag_block = ("\n".join(tag_lines) if tag_lines
+                         else "(no chunk cleared the diagnostic-tag confidence threshold)")
             records.append({
                 "Inputs": traj["data"]["input"][:500],
                 "Generated Outputs": traj["response"][:1000],
                 "Feedback": f"The answer was {correct_str}. Expected answer: {traj['data']['answer']}. "
                             f"{('Reference solution: ' + additional) if additional else ''}\n\n"
-                            f"Per-step diagnostic tags:\n" + "\n".join(tag_lines),
+                            f"Per-step diagnostic tags (only shown where confidence >= {self.TAG_THRESHOLD}):\n" + tag_block,
             })
         return {component: records}

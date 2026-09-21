@@ -12,10 +12,18 @@ import gepa
 from gepa.examples.aime import init_dataset
 from aime_gepa_adapter import AIMEAdapter, _with_hard_timeout
 
-PIT_KEY = json.load(open(Path.home() / "pit_config.json"))["api_key"]
-PIT_BASE = "https://api.pinference.ai/api/v1"
-TASK_MODEL = "openai/Qwen/Qwen3.5-4B"
-REFLECTION_MODEL = "openai/openai/gpt-oss-120b"
+import os
+os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", os.path.expanduser("~/adc.json"))
+GCP_PROJECT = "intrepid-app-509303-p9"
+GCP_LOCATION = "europe-west4"
+VERTEX_KWARGS = {"vertex_project": GCP_PROJECT, "vertex_location": GCP_LOCATION}
+TASK_MODEL = "vertex_ai/gemini-2.5-flash-lite"  # $0.10/$0.40 per 1M -- cheapest
+                                                  # real option; no hidden
+                                                  # thinking-token budget (unlike
+                                                  # gemini-2.5-flash, which burned
+                                                  # 7681/8000 tokens on hidden
+                                                  # reasoning in a live test)
+REFLECTION_MODEL = "vertex_ai/gemini-2.5-pro"
 MAX_METRIC_CALLS = 60
 
 print("Loading AIME dataset...", flush=True)
@@ -33,14 +41,19 @@ seed_candidate = {
 def reflection_lm_fn(prompt: str) -> str:
     def call():
         return litellm.completion(
-            model=REFLECTION_MODEL, api_base=PIT_BASE, api_key=PIT_KEY,
+            model=REFLECTION_MODEL,
             messages=[{"role": "user", "content": prompt}], timeout=240,
+            max_tokens=16000,  # gemini-2.5-pro has hidden thinking tokens too;
+                               # reflection calls are infrequent so the extra
+                               # headroom costs little, but a truncated proposed
+                               # edit would be a real, silent failure mode.
+            **VERTEX_KWARGS,
         )
     resp = _with_hard_timeout(call)
     return (resp.choices[0].message.content or "") if resp else ""
 
 
-adapter = AIMEAdapter(TASK_MODEL, PIT_BASE, PIT_KEY)
+adapter = AIMEAdapter(TASK_MODEL, VERTEX_KWARGS)
 
 print(f"\n{'='*70}\nRunning GEPA on AIME: baseline\n{'='*70}", flush=True)
 result = gepa.optimize(
