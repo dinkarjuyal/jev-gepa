@@ -1,0 +1,208 @@
+"""GEPAAdapter for GEPA's own bundled AIME benchmark (real problems from
+AI-MO/aimo-validation-aime + MathArena/aime_2025 -- one of GEPA's own paper
+tasks, chosen specifically to be fast: one LLM call per rollout, no
+environment, no Docker). Reasoning is chunked into sentences so Jev has
+per-chunk text to score, same mechanism as the trace-based adapters, applied
+to a single chain-of-thought instead of a multi-turn agent trace.
+"""
+from __future__ import annotations
+
+import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from typing import TypedDict
+
+import litellm
+from gepa.core.adapter import EvaluationBatch, GEPAAdapter
+
+# Real bug found live, twice, burning real budget both times: litellm's own
+# `timeout=` kwarg did NOT reliably fire -- two separate calls hung for
+# 15-73+ minutes with zero CPU activity (confirmed via `ps -o etimes,time`:
+# wall time climbing, process time frozen), well past the 270s timeout that
+# was supposedly set. Every real successful call in this whole project has
+# taken 57-90s; a hard, EXTERNALLY-enforced timeout via a worker thread
+# (which the caller can walk away from even if the thread itself never
+# returns) is the actual fix -- it can't be silently bypassed by whatever
+# layer (httpx connection pool, DNS, the remote server itself) was eating
+# litellm's own timeout.
+_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
+
+def _with_hard_timeout(fn, timeout_s: float = 150.0, retries: int = 1):
+    for attempt in range(retries + 1):
+        fut = _EXECUTOR.submit(fn)
+        try:
+            return fut.result(timeout=timeout_s)
+        except FutureTimeoutError:
+            if attempt == retries:
+                return None  # give up; caller treats this as an empty/failed response
+            # the abandoned thread keeps running in the background and is never
+            # awaited again -- acceptable here since ThreadPoolExecutor doesn't
+            # leak resources for this, just wastes one worker slot until (if
+            # ever) the underlying call actually returns.
+
+
+class AIMEDataInst(TypedDict):
+    input: str
+    additional_context: dict
+    answer: str
+
+
+class AIMETrajectory(TypedDict):
+    data: AIMEDataInst
+    response: str
+    chunks: list[str]
+    correct: bool
+
+
+class AIMERolloutOutput(TypedDict):
+    response: str
+    correct: bool
+
+
+def _extract_int(text: str) -> int | None:
+    # AIME answers are 0-999, dataset stores them zero-padded ("### 073").
+    # Real bug found live: a correct, unpadded "### 73" from the model was
+    # being scored wrong by a literal "### 073" in response substring check
+    # -- compare as integers instead, using the LAST "### <n>" match (the
+    # final-answer line per the seed prompt's own instructions).
+    matches = re.findall(r"###\s*(\d+)", text)
+    return int(matches[-1]) if matches else None
+
+
+def _chunk(text: str, cap: int = 24) -> list[dict]:
+    # split into rough reasoning "steps" (sentences/short paragraphs) for
+    # per-chunk Jev scoring -- same idea as per-turn scoring on agent traces,
+    # applied to a single chain-of-thought. Returns {"text": <chunk for
+    # display>, "premise": <chunk prefixed with ~200 chars of the PRECEDING
+    # chunk, for scoring>}.
+    #
+    # Real bug found live, offline, for free (no GPU spend): scoring each
+    # chunk bare/context-free left most of the diagnostic bank near-dead --
+    # e.g. made_concrete_progress never exceeded 0.29 confidence across 720
+    # real chunks, commits_to_final_answer exceeded 0.5 in only 0.1% of
+    # cases -- because those are PRAGMATIC/functional claims ("commits to",
+    # "verifies", "abandons") that need to know what came before to judge,
+    # unlike the one strong tag (made_arithmetic_step, a literal, self-
+    # contained, content-checkable claim, which never needed context).
+    # Validated fix (720-item A/B on real saved chunks, same GPU, ~5 min):
+    # prefixing ~200 chars of the preceding chunk as premise context nearly
+    # doubled the overall >0.5-confidence rate (5.5%->8.3%) and helped every
+    # pragmatic tag substantially (e.g. commits_to_final_answer's max jumped
+    # 0.62->0.93); the two tags that stayed weak regardless
+    # (made_concrete_progress, restates_problem) are weak in the statement
+    # itself, not from missing context.
+    #
+    # Earlier bug found live: a reasoning model's full response (content +
+    # reasoning_content) runs up to ~15-17K chars -- a naive [:12] truncation
+    # only ever sampled the opening ~10-15% of the trace, meaning Jev's tags
+    # for "verified_own_work" and "commits_to_final_answer" -- both
+    # necessarily LATE-trace behaviors -- could almost never fire. Fixed by
+    # evenly sampling across the whole trace instead of always taking the
+    # prefix, so the diagnostic tags actually cover beginning/middle/end.
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+|\n+", text) if len(p.strip()) > 15]
+    if len(parts) <= cap:
+        idxs = list(range(len(parts)))
+    else:
+        idxs = list(dict.fromkeys(round(i * (len(parts) - 1) / (cap - 1)) for i in range(cap)))
+    out = []
+    for i in idxs:
+        prev = parts[i - 1] if i > 0 else ""
+        premise = (prev[-200:] + " " + parts[i]).strip() if prev else parts[i]
+        out.append({"text": parts[i], "premise": premise})
+    return out
+
+
+def _solve(model: str, api_base: str, api_key: str, system_prompt: str, problem: str) -> str:
+    def call():
+        return litellm.completion(
+            model=model, api_base=api_base, api_key=api_key,
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": problem}],
+            timeout=270,
+            # root cause of 3 straight saturated-at-zero AIME runs, confirmed by
+            # direct inspection: Qwen3.5-4B is a REASONING model -- it was solving
+            # problems correctly (verified: n_4=73 for the real answer 073) inside
+            # reasoning_content, but 1500/6000 max_tokens cut generation off via
+            # finish_reason="length" before it ever reached the formatted "### "
+            # answer in `content`, which came back None every time. At ~260 tok/s
+            # observed, 16000 tokens is still only ~60s/call.
+            max_tokens=16000,
+        )
+
+    resp = _with_hard_timeout(call)
+    if resp is None:
+        return ""  # hard-timed-out twice; treated as a real (empty, incorrect) response
+    msg = resp.choices[0].message
+    content = msg.content or ""
+    reasoning = getattr(msg, "reasoning_content", None) or ""
+    # fall back to reasoning text so a real answer that never made it into the
+    # formatted `content` field (still cut short) isn't scored as a miss when
+    # it was actually reached -- append rather than replace so a well-formed
+    # `content` answer is still found first/normally.
+    return (content + "\n" + reasoning) if reasoning else content
+
+
+class AIMEAdapter(GEPAAdapter[AIMEDataInst, AIMETrajectory, AIMERolloutOutput]):
+    def __init__(self, model: str, api_base: str, api_key: str):
+        self.model, self.api_base, self.api_key = model, api_base, api_key
+
+    def evaluate(self, batch, candidate, capture_traces=False):
+        system_prompt = next(iter(candidate.values()))
+        outputs, scores, trajectories = [], [], [] if capture_traces else None
+        for data in batch:
+            response = _solve(self.model, self.api_base, self.api_key, system_prompt, data["input"])
+            expected = _extract_int(data["answer"])
+            got = _extract_int(response)
+            correct = expected is not None and got is not None and expected == got
+            score = 1.0 if correct else 0.0
+            outputs.append({"response": response, "correct": correct})
+            scores.append(score)
+            if capture_traces:
+                trajectories.append({"data": data, "response": response,
+                                      "chunks": _chunk(response), "correct": correct})
+        return EvaluationBatch(outputs=outputs, scores=scores, trajectories=trajectories)
+
+    def make_reflective_dataset(self, candidate, eval_batch, components_to_update):
+        component = components_to_update[0]
+        records = []
+        for traj in eval_batch.trajectories or []:
+            feedback = traj["response"][:1500]
+            correct_str = "CORRECT" if traj["correct"] else "INCORRECT"
+            additional = "\n".join(f"{k}: {v}" for k, v in traj["data"]["additional_context"].items())
+            records.append({
+                "Inputs": traj["data"]["input"][:500],
+                "Generated Outputs": feedback,
+                "Feedback": f"The answer was {correct_str}. Expected answer: {traj['data']['answer']}. "
+                            f"{('Reference solution: ' + additional) if additional else ''}",
+            })
+        return {component: records}
+
+
+class JevAIMEAdapter(AIMEAdapter):
+    def __init__(self, model: str, api_base: str, api_key: str, jev, questions: dict[str, str]):
+        super().__init__(model, api_base, api_key)
+        self.jev, self.questions = jev, questions
+
+    def make_reflective_dataset(self, candidate, eval_batch, components_to_update):
+        component = components_to_update[0]
+        records = []
+        for traj in eval_batch.trajectories or []:
+            correct_str = "CORRECT" if traj["correct"] else "INCORRECT"
+            tag_lines = []
+            for chunk in traj["chunks"]:
+                # score with context-augmented premise (validated: nearly
+                # doubles confident-tag rate vs. the bare chunk alone), but
+                # display just the chunk's own text for readability.
+                pairs = [(chunk["premise"], stmt) for stmt in self.questions.values()]
+                preds = self.jev.predict(pairs)
+                tags = ", ".join(f"{name}={float(p[1]):.2f}" for name, p in zip(self.questions, preds))
+                tag_lines.append(f"[{chunk['text'][:150]}] -> {tags}")
+            additional = "\n".join(f"{k}: {v}" for k, v in traj["data"]["additional_context"].items())
+            records.append({
+                "Inputs": traj["data"]["input"][:500],
+                "Generated Outputs": traj["response"][:1000],
+                "Feedback": f"The answer was {correct_str}. Expected answer: {traj['data']['answer']}. "
+                            f"{('Reference solution: ' + additional) if additional else ''}\n\n"
+                            f"Per-step diagnostic tags:\n" + "\n".join(tag_lines),
+            })
+        return {component: records}
