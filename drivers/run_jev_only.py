@@ -56,12 +56,33 @@ QUESTIONS = {
 
 from aime_gepa_adapter import _with_hard_timeout  # noqa: E402  (same hard-timeout fix as _solve())
 
+# Real finding from reading actual traces (both arms, both reflection models
+# tested -- gpt-oss-120b on Qwen runs AND gemini-2.5-pro): the reflection
+# model reliably turns ANY feedback into a 15-35x longer, checklist-style
+# instruction (seed=128 chars; every single proposed mutation across every
+# run so far was 1,450-4,689 chars) -- and the tiny seed beat every one of
+# those elaborations on held-out validation, in both arms, every time this
+# was checked. This isn't Jev-specific: it's what this reflection model does
+# with any input. Constraining its OUTPUT directly -- not the diagnostic
+# input -- is the fix this finding actually points to. Applied identically
+# in run_baseline_only.py so this stays a fair, controlled comparison.
+CONCISENESS_CONSTRAINT = (
+    "\n\nIMPORTANT: Your proposed instruction text must be concise -- at most "
+    "2-3 sentences, well under 400 characters total. Do NOT add procedural "
+    "checklists, a 'toolbox' of theorems, worked-example templates, or "
+    "mandated multi-step verification sections. A short, direct instruction "
+    "close in length and style to this one is strongly preferred over an "
+    "elaborate one: 'You are a mathematics expert. Solve the given AIME "
+    "problem step by step and give your final numeric answer prefixed with "
+    "\"### \".' Do not pad the instructions with extra structure."
+)
+
 
 def reflection_lm_fn(prompt: str) -> str:
     def call():
         return litellm.completion(
             model=REFLECTION_MODEL,
-            messages=[{"role": "user", "content": prompt}], timeout=240,
+            messages=[{"role": "user", "content": prompt + CONCISENESS_CONSTRAINT}], timeout=240,
             max_tokens=16000, **VERTEX_KWARGS,
         )
     resp = _with_hard_timeout(call)
