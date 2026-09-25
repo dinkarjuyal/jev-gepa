@@ -39,8 +39,12 @@ sys.path.insert(0, snap_dirs[0])
 from modeling_openjev import OpenJevCrossEncoder
 
 print("Loading OpenJev...", flush=True)
-jev = OpenJevCrossEncoder(snap_dirs[0], subfolder="qwen3.5-4b-nli")
-print("Loaded.", flush=True)
+# v5 checkpoint (2026-09): trained on a larger/harder mixture, higher JevBench
+# accuracy (0.814 vs v4's 0.779) and stronger faithfulness-benchmark AUROC
+# (RAGTruth 0.932, HaluBench 0.937) than the base qwen3.5-4b-nli checkpoint
+# used in rounds 1-4 -- same repo/interface, HF-card-recommended upgrade.
+jev = OpenJevCrossEncoder(snap_dirs[0], subfolder="qwen3.5-4b-nli-v5")
+print("Loaded (v5 checkpoint).", flush=True)
 
 QUESTIONS = {
     "made_concrete_progress": "The step makes concrete progress toward solving the problem.",
@@ -111,7 +115,7 @@ out = {
 print("\njev_enriched val_aggregate_scores:", result.val_aggregate_scores, flush=True)
 print("jev_enriched best_idx:", result.best_idx, flush=True)
 
-with open(Path.home() / "gepa_jev_aime_results_jev.json", "w") as f:
+with open(Path.home() / "gepa_jev_aime_results_jev_v5.json", "w") as f:
     json.dump(out, f, indent=2)
 
 # Re-run the best candidate on the full valset with trace capture ON, purely to
@@ -136,7 +140,7 @@ for data, output, score, traj in zip(valset, eval_batch.outputs, eval_batch.scor
         "tagged_chunks": tag_lines,
     })
 
-with open(Path.home() / "gepa_jev_aime_examples_jev.json", "w") as f:
+with open(Path.home() / "gepa_jev_aime_examples_jev_v5.json", "w") as f:
     json.dump(examples, f, indent=2)
 
-print("\n\nDONE. Saved to ~/gepa_jev_aime_results_jev.json and ~/gepa_jev_aime_examples_jev.json", flush=True)
+print("\n\nDONE. Saved to ~/gepa_jev_aime_results_jev_v5.json and ~/gepa_jev_aime_examples_jev_v5.json", flush=True)
